@@ -10,11 +10,27 @@ app = FastAPI(
 
 def load_from_drive(file_id: str):
     print("Downloading transactions from Google Drive...")
-    url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-    lines = response.content.decode("utf-8").splitlines()
-    data  = [json.loads(line) for line in lines if line.strip()]
+    
+    # Step 1: Start download — Drive redirects large files through a confirm page
+    session  = requests.Session()
+    url      = f"https://drive.google.com/uc?export=download&id={file_id}"
+    response = session.get(url, stream=True)
+    
+    # Step 2: Extract the confirmation token from the warning page
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    # Step 3: Re-request with the confirmation token
+    if token:
+        response = session.get(url, params={"confirm": token}, stream=True)
+
+    # Step 4: Parse the actual JSONL content
+    content = response.content.decode("utf-8")
+    lines   = content.splitlines()
+    data    = [json.loads(line) for line in lines if line.strip()]
     print(f"Loaded {len(data):,} transactions")
     return data
 
