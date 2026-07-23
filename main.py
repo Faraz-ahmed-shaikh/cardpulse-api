@@ -1,12 +1,26 @@
 from fastapi import FastAPI, Query
 from typing import Optional
-import json
+import json, requests, io
 
 app = FastAPI(
     title="CardPulse Transactions API",
     description="Mock payment processor feed for CardPulse ELT pipeline",
     version="1.0.0"
 )
+
+def load_from_drive(file_id: str):
+    print("Downloading transactions from Google Drive...")
+    url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    lines = response.content.decode("utf-8").splitlines()
+    data  = [json.loads(line) for line in lines if line.strip()]
+    print(f"Loaded {len(data):,} transactions")
+    return data
+
+# Replace with your actual file ID
+FILE_ID = "1PH42kRgtSdr1dB3fS6TXEPx23CBfYTZi"
+ALL_TRANSACTIONS = load_from_drive(FILE_ID)
 
 # Load once on startup — stays in memory
 print("Loading transactions...")
