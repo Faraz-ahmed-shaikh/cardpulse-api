@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query
 from typing import Optional
-import json, requests
+import json, requests, io
 
 app = FastAPI(
     title="CardPulse Transactions API",
@@ -8,33 +8,58 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Direct download URL from Hugging Face — no confirmation pages, always works
 HF_URL = "https://huggingface.co/datasets/farazahmed417/cardpulse-transactions/resolve/main/transactions_all.jsonl"
 
-def load_data(url: str):
-    print(f"Downloading transactions from Hugging Face...")
-    response = requests.get(url, stream=True)
+def stream_transactions(date: str = None, status: str = None,
+                         limit: int = 1000, offset: int = 0):
+    """Stream JSONL from HF, filter on the fly — never loads full file into RAM."""
+    response = requests.get(HF_URL, stream=True)
     response.raise_for_status()
-    lines = response.content.decode("utf-8").splitlines()
-    data  = [json.loads(line) for line in lines if line.strip()]
-    print(f"Loaded {len(data):,} transactions")
-    return data
 
-ALL_TRANSACTIONS = load_data(HF_URL)
+    matched = []
+    skipped = 0
 
-# --- all endpoints stay exactly the same, no changes needed ---
+    for raw_line in response.iter_lines():
+        if not raw_line:
+            continue
+        try:
+            txn = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+
+        # Apply filters
+        if date and not txn.get("transaction_timestamp", "").startswith(date):
+            continue
+        if status and txn.get("status") != status:
+            continue
+
+        # Apply offset
+        if skipped < offset:
+            skipped += 1
+            continue
+
+        matched.append(txn)
+
+        if len(matched) >= limit:
+            break
+
+    return matched
+
 
 @app.get("/")
 def root():
     return {
-        "project": "CardPulse Transactions API",
-        "total_transactions": len(ALL_TRANSACTIONS),
-        "endpoints": ["/transactions", "/transactions/date/{date}", "/health"]
+        "project":   "CardPulse Transactions API",
+        "note":      "Streaming mode — filters applied on the fly",
+        "endpoints": ["/transactions", "/transactions/date/{date}",
+                      "/transactions/batch/{batch_number}", "/health"]
     }
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "records_loaded": len(ALL_TRANSACTIONS)}
+    return {"status": "ok", "mode": "streaming"}
+
 
 @app.get("/transactions")
 def get_transactions(
@@ -42,44 +67,26 @@ def get_transactions(
     offset: int           = Query(0),
     status: Optional[str] = Query(None),
 ):
-    filtered = ALL_TRANSACTIONS
-    if status:
-        filtered = [t for t in filtered if t.get("status") == status]
-    return {
-        "total_matched": len(filtered),
-        "offset":        offset,
-        "limit":         limit,
-        "data":          filtered[offset: offset + limit]
-    }
+    data = stream_transactions(status=status, limit=limit, offset=offset)
+    return {"limit": limit, "offset": offset, "count": len(data), "data": data}
+
 
 @app.get("/transactions/date/{date}")
 def get_by_date(
     date:   str,
-    limit:  int = Query(5000, le=10000),
+    limit:  int = Query(5000, le=5000),
     offset: int = Query(0)
 ):
-    filtered = [
-        t for t in ALL_TRANSACTIONS
-        if t.get("transaction_timestamp", "").startswith(date)
-    ]
-    return {
-        "date":          date,
-        "total_matched": len(filtered),
-        "offset":        offset,
-        "limit":         limit,
-        "data":          filtered[offset: offset + limit]
-    }
+    data = stream_transactions(date=date, limit=limit, offset=offset)
+    return {"date": date, "count": len(data), "data": data}
+
 
 @app.get("/transactions/batch/{batch_number}")
 def get_batch(
     batch_number: int,
     size:         int = Query(1000, le=5000)
 ):
-    start         = batch_number * size
-    total_batches = (len(ALL_TRANSACTIONS) + size - 1) // size
-    return {
-        "batch_number":  batch_number,
-        "total_batches": total_batches,
-        "size":          size,
-        "data":          ALL_TRANSACTIONS[start: start + size]
-    }
+    offset = batch_number * size
+    data   = stream_transactions(limit=size, offset=offset)
+    return {"batch_number": batch_number, "size": size,
+            "count": len(data), "data": data}
