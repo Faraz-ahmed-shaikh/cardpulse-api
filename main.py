@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query
 from typing import Optional
-import json, requests, io
+import json, requests
 
 app = FastAPI(
     title="CardPulse Transactions API",
@@ -8,42 +8,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
-def load_from_drive(file_id: str):
-    print("Downloading transactions from Google Drive...")
-    
-    # Step 1: Start download — Drive redirects large files through a confirm page
-    session  = requests.Session()
-    url      = f"https://drive.google.com/uc?export=download&id={file_id}"
-    response = session.get(url, stream=True)
-    
-    # Step 2: Extract the confirmation token from the warning page
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
+# Direct download URL from Hugging Face — no confirmation pages, always works
+HF_URL = "https://huggingface.co/datasets/farazahmed417/cardpulse-transactions/resolve/main/transactions_all.jsonl"
 
-    # Step 3: Re-request with the confirmation token
-    if token:
-        response = session.get(url, params={"confirm": token}, stream=True)
-
-    # Step 4: Parse the actual JSONL content
-    content = response.content.decode("utf-8")
-    lines   = content.splitlines()
-    data    = [json.loads(line) for line in lines if line.strip()]
+def load_data(url: str):
+    print(f"Downloading transactions from Hugging Face...")
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    lines = response.content.decode("utf-8").splitlines()
+    data  = [json.loads(line) for line in lines if line.strip()]
     print(f"Loaded {len(data):,} transactions")
     return data
 
-# Replace with your actual file ID
-FILE_ID = "1PH42kRgtSdr1dB3fS6TXEPx23CBfYTZi"
-ALL_TRANSACTIONS = load_from_drive(FILE_ID)
+ALL_TRANSACTIONS = load_data(HF_URL)
 
-# Load once on startup — stays in memory
-print("Loading transactions...")
-with open("transactions_all.jsonl", "r") as f:
-    ALL_TRANSACTIONS = [json.loads(line) for line in f if line.strip()]
-print(f"Loaded {len(ALL_TRANSACTIONS):,} transactions")
-
+# --- all endpoints stay exactly the same, no changes needed ---
 
 @app.get("/")
 def root():
@@ -53,23 +32,19 @@ def root():
         "endpoints": ["/transactions", "/transactions/date/{date}", "/health"]
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "records_loaded": len(ALL_TRANSACTIONS)}
 
-
 @app.get("/transactions")
 def get_transactions(
-    limit:  int            = Query(1000, le=5000, description="Max rows to return"),
-    offset: int            = Query(0,             description="Skip first N rows"),
-    status: Optional[str]  = Query(None,          description="Filter by status: Successful / Failed / Pending"),
+    limit:  int           = Query(1000, le=5000),
+    offset: int           = Query(0),
+    status: Optional[str] = Query(None),
 ):
     filtered = ALL_TRANSACTIONS
-
     if status:
         filtered = [t for t in filtered if t.get("status") == status]
-
     return {
         "total_matched": len(filtered),
         "offset":        offset,
@@ -77,22 +52,16 @@ def get_transactions(
         "data":          filtered[offset: offset + limit]
     }
 
-
 @app.get("/transactions/date/{date}")
 def get_by_date(
     date:   str,
     limit:  int = Query(5000, le=10000),
     offset: int = Query(0)
 ):
-    """
-    Pull all transactions for a specific date.
-    date format: YYYY-MM-DD  e.g. /transactions/date/2024-10-01
-    """
     filtered = [
         t for t in ALL_TRANSACTIONS
         if t.get("transaction_timestamp", "").startswith(date)
     ]
-
     return {
         "date":          date,
         "total_matched": len(filtered),
@@ -101,24 +70,16 @@ def get_by_date(
         "data":          filtered[offset: offset + limit]
     }
 
-
 @app.get("/transactions/batch/{batch_number}")
 def get_batch(
     batch_number: int,
-    size:         int = Query(1000, le=5000, description="Rows per batch")
+    size:         int = Query(1000, le=5000)
 ):
-    """
-    Pull transactions by batch number.
-    Useful for paginating the full dataset in your Databricks pipeline.
-    batch 0 → rows 0-999, batch 1 → rows 1000-1999, etc.
-    """
-    start = batch_number * size
-    end   = start + size
+    start         = batch_number * size
     total_batches = (len(ALL_TRANSACTIONS) + size - 1) // size
-
     return {
         "batch_number":  batch_number,
         "total_batches": total_batches,
         "size":          size,
-        "data":          ALL_TRANSACTIONS[start:end]
+        "data":          ALL_TRANSACTIONS[start: start + size]
     }
