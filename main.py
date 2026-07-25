@@ -8,7 +8,7 @@ app = FastAPI(
     version="3.0.0"
 )
 
-CONN_STR = "postgresql://user:password@host/neondb?sslmode=require"
+CONN_STR = "postgresql://neondb_owner:npg_WQD4UYhrXo8H@ep-withered-cell-ay6cmuw3-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
 def get_conn():
     return psycopg2.connect(CONN_STR)
