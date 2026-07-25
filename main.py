@@ -1,17 +1,19 @@
-import os
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from typing import Optional
 import psycopg2
+import os
 
 app = FastAPI(
     title="CardPulse Transactions API",
     description="Mock payment processor feed for CardPulse ELT pipeline",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 CONN_STR = os.environ.get("NEON_CONN_STR")
 
 def get_conn():
+    if not CONN_STR:
+        raise HTTPException(status_code=500, detail="Database connection not configured")
     return psycopg2.connect(CONN_STR)
 
 def rows_to_dicts(cur):
@@ -28,10 +30,15 @@ def rows_to_dicts(cur):
 @app.get("/")
 def root():
     return {
-        "project":   "CardPulse Transactions API",
-        "endpoints": ["/transactions", "/transactions/date/{date}",
-                      "/transactions/batch/{batch_number}",
-                      "/transactions/since", "/health"]
+        "project": "CardPulse Transactions API",
+        "version": "4.0.0",
+        "endpoints": {
+            "health":      "GET /health",
+            "incremental": "GET /transactions?updated_after=2024-10-01T00:00:00Z",
+            "paginate":    "GET /transactions?updated_after=X&limit=5000&offset=0",
+            "filter":      "GET /transactions?updated_after=X&status=Failed",
+            "batch":       "GET /transactions/batch/{n}?size=1000",
+        }
     }
 
 
@@ -47,68 +54,64 @@ def health():
 
 @app.get("/transactions")
 def get_transactions(
-    limit:  int           = Query(1000, le=5000),
-    offset: int           = Query(0),
-    status: Optional[str] = Query(None),
+    updated_after: Optional[str] = Query(
+        None,
+        description="ISO 8601 timestamp — returns rows where updated_at > this value. "
+                    "Example: 2024-10-01T00:00:00Z. "
+                    "Omit for full load."
+    ),
+    status: Optional[str] = Query(
+        None,
+        description="Filter by status: Successful | Failed | Pending"
+    ),
+    limit:  int = Query(1000, ge=1, le=10000, description="Page size (max 10000)"),
+    offset: int = Query(0,    ge=0,           description="Number of rows to skip"),
 ):
+    """
+    Primary ingestion endpoint.
+
+    For incremental loading pass updated_after = last pipeline run timestamp.
+    Pipeline stores this watermark in a metadata table and passes it on
+    every run to fetch only new or updated rows.
+
+    For full load omit updated_after entirely.
+    """
     conn = get_conn()
     try:
+        filters = []
+        params  = {"limit": limit, "offset": offset}
+
+        if updated_after:
+            filters.append("updated_at > %(updated_after)s")
+            params["updated_after"] = updated_after
+
         if status:
-            query = "SELECT * FROM transactions WHERE status = %(status)s ORDER BY updated_at ASC LIMIT %(limit)s OFFSET %(offset)s"
-            params = {"status": status, "limit": limit, "offset": offset}
-        else:
-            query = "SELECT * FROM transactions ORDER BY updated_at ASC LIMIT %(limit)s OFFSET %(offset)s"
-            params = {"limit": limit, "offset": offset}
+            filters.append("status = %(status)s")
+            params["status"] = status
+
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        query = f"""
+            SELECT *
+            FROM transactions
+            {where}
+            ORDER BY updated_at ASC
+            LIMIT %(limit)s
+            OFFSET %(offset)s
+        """
 
         cur = conn.cursor()
         cur.execute(query, params)
         rows = rows_to_dicts(cur)
-        return {"limit": limit, "offset": offset, "count": len(rows), "data": rows}
-    finally:
-        conn.close()
 
-
-@app.get("/transactions/since")
-def get_since(
-    timestamp: str = Query(..., description="ISO format: 2024-10-01T00:00:00"),
-    limit:     int = Query(5000, le=10000),
-    offset:    int = Query(0)
-):
-    """Incremental loading endpoint — returns rows where updated_at > timestamp."""
-    conn = get_conn()
-    try:
-        query = """
-            SELECT * FROM transactions
-            WHERE updated_at > %(ts)s
-            ORDER BY updated_at ASC
-            LIMIT %(limit)s OFFSET %(offset)s
-        """
-        cur = conn.cursor()
-        cur.execute(query, {"ts": timestamp, "limit": limit, "offset": offset})
-        rows = rows_to_dicts(cur)
-        return {"since": timestamp, "count": len(rows), "limit": limit, "offset": offset, "data": rows}
-    finally:
-        conn.close()
-
-
-@app.get("/transactions/date/{date}")
-def get_by_date(
-    date:   str,
-    limit:  int = Query(5000, le=10000),
-    offset: int = Query(0)
-):
-    conn = get_conn()
-    try:
-        query = """
-            SELECT * FROM transactions
-            WHERE DATE(transaction_timestamp) = %(date)s
-            ORDER BY updated_at ASC
-            LIMIT %(limit)s OFFSET %(offset)s
-        """
-        cur = conn.cursor()
-        cur.execute(query, {"date": date, "limit": limit, "offset": offset})
-        rows = rows_to_dicts(cur)
-        return {"date": date, "count": len(rows), "limit": limit, "offset": offset, "data": rows}
+        return {
+            "updated_after": updated_after or "none (full load)",
+            "status_filter": status or "none",
+            "limit":         limit,
+            "offset":        offset,
+            "count":         len(rows),
+            "data":          rows
+        }
     finally:
         conn.close()
 
@@ -116,15 +119,30 @@ def get_by_date(
 @app.get("/transactions/batch/{batch_number}")
 def get_batch(
     batch_number: int,
-    size:         int = Query(1000, le=5000)
+    size: int = Query(1000, ge=1, le=5000, description="Rows per batch")
 ):
+    """
+    Batch pagination endpoint.
+    Useful for full historical load — iterate batch 0, 1, 2 ... until empty.
+    """
     conn = get_conn()
     try:
         offset = batch_number * size
-        query  = "SELECT * FROM transactions ORDER BY updated_at ASC LIMIT %(size)s OFFSET %(offset)s"
-        cur    = conn.cursor()
+        query  = """
+            SELECT * FROM transactions
+            ORDER BY updated_at ASC
+            LIMIT %(size)s
+            OFFSET %(offset)s
+        """
+        cur = conn.cursor()
         cur.execute(query, {"size": size, "offset": offset})
         rows = rows_to_dicts(cur)
-        return {"batch_number": batch_number, "size": size, "count": len(rows), "data": rows}
+        return {
+            "batch_number": batch_number,
+            "size":         size,
+            "count":        len(rows),
+            "has_more":     len(rows) == size,
+            "data":         rows
+        }
     finally:
         conn.close()
