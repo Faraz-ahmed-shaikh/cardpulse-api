@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Query
 from typing import Optional
 import psycopg2
@@ -8,7 +9,7 @@ app = FastAPI(
     version="3.0.0"
 )
 
-CONN_STR = "postgresql://neondb_owner:npg_WQD4UYhrXo8H@ep-withered-cell-ay6cmuw3-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+CONN_STR = os.environ.get("NEON_CONN_STR")
 
 def get_conn():
     return psycopg2.connect(CONN_STR)
